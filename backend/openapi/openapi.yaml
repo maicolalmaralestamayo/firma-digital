@@ -1,0 +1,1072 @@
+openapi: 3.0.3
+info:
+  title: Firma Digital API
+  version: 1.0.0
+  summary: Firma digital de PDF con certificados PKCS#12 y flujos multiformante
+  description: |
+    API REST que sigue el formato **JSON:API 1.1** (https://jsonapi.org/format/) para
+    firmar digitalmente documentos PDF con un certificado `.p12`/`.pfx`.
+
+    ## Convenciones
+    - Todas las respuestas JSON usan `Content-Type: application/vnd.api+json`.
+      Envía `Accept: application/vnd.api+json`, `application/json` o `*/*`.
+    - Los documentos JSON:API se componen de `data`, `included`, `links`, `meta` y `errors`.
+    - Los errores se devuelven como `{"errors": [{"status", "code", "title", "detail", "source"}]}`.
+    - Autenticación con token Bearer de Laravel Sanctum (`Authorization: Bearer <token>`).
+    - Colecciones paginadas: `page[number]`, `page[size]` (máximo 50), `meta.pagination`.
+    - Relaciones incluidas: `include=owner,signers,signatures,deletion_requests`, `include=consents,requested_by`.
+    - Orden: `sort=created_at|-created_at|title|status|sealed_at`.
+    - Filtros: `filter[role]=all|owner|signer`, `filter[status]=open|sealed`,
+      `filter[search]=texto`.
+
+    ## Firma
+    La firma criptográfica es CMS/PAdES (`ETSI.CAdES.detached`). En documentos con
+    varios firmantes cada firma se agrega como **actualización incremental**: los
+    bytes ya firmados no se reescriben y todas las firmas anteriores siguen siendo
+    válidas.
+
+    La estampa visible se compone de la **imagen subida** y, a su lado, los **datos
+    del certificado** (firmante, número de serie, emisor, fecha y huella SHA-256 del
+    certificado).
+
+    ### Sistema de coordenadas
+    `page` es 1-based. `x` e `y` son puntos (1 pt = 1/72 pulgada) medidos desde la
+    **esquina superior izquierda de la página tal como se muestra** (el mismo espacio
+    que dibuja el visor PDF). `width` y `height` son el tamaño de la estampa en
+    puntos. El servidor convierte esas coordenadas al espacio interno del PDF y
+    respeta la rotación (`/Rotate`) de cada página.
+
+    ## Reglas del flujo con registro
+    1. El creador define `signers_required` y una invitación por correo por firmante.
+    2. Solo los firmantes invitados pueden firmar, una vez cada uno.
+    3. Cuando firma el último firmante, el documento pasa a `sealed` (cerrado) y ya
+       no admite firmas; los firmantes pueden descargarlo e imprimirlo.
+    4. Un documento sin firmas lo elimina su creador. Un documento firmado solo se
+       elimina cuando **todos** los firmantes han firmado y dan su consentimiento;
+       un rechazo cancela la solicitud.
+  contact:
+    name: Firma Digital
+    url: /
+servers:
+  - url: /api/v1
+    description: Servidor actual
+tags:
+  - name: Firma anónima
+    description: Sin cuenta ni persistencia de datos.
+  - name: Autenticación
+    description: Registro, login y perfil.
+  - name: Documentos
+    description: Ciclo de vida de documentos compartidos.
+  - name: Firmas
+    description: Estampado y firma incremental.
+  - name: Eliminación con consentimiento
+    description: Eliminación aprobada por todos los firmantes.
+  - name: Verificación
+    description: Comprobación de integridad de las firmas.
+  - name: Descripción de la API
+    description: OpenAPI y visor de documentación.
+security:
+  - bearerAuth: []
+paths:
+  /signatures:
+    post:
+      tags: [Firma anónima]
+      summary: Firmar un PDF sin cuenta
+      description: |
+        Sube el PDF, el certificado, la contraseña y la imagen de la estampa; indica
+        la posición y recibe el PDF firmado como binario.
+
+        No se persiste ninguna copia: los archivos se procesan en memoria y se
+        descartan al responder. La contraseña solo se usa para abrir el PKCS#12.
+      security: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [pdf, certificate, password, image, page, x, y, width, height]
+              properties:
+                pdf:
+                  type: string
+                  format: binary
+                  description: PDF a firmar (máx. 20 MB, sin cifrar).
+                certificate:
+                  type: string
+                  format: binary
+                  description: Certificado PKCS#12 `.p12` o `.pfx` (máx. 512 KB).
+                password:
+                  type: string
+                  format: password
+                  description: Contraseña del certificado.
+                image:
+                  type: string
+                  format: binary
+                  description: Imagen PNG o JPEG de la estampa (máx. 4 MB).
+                page:
+                  type: integer
+                  minimum: 1
+                  description: Página (1-based) donde se estampa la firma.
+                x:
+                  type: number
+                  description: Distancia en puntos desde el borde izquierdo visible.
+                y:
+                  type: number
+                  description: Distancia en puntos desde el borde superior visible.
+                width:
+                  type: number
+                  description: Ancho de la estampa en puntos (mínimo 120).
+                height:
+                  type: number
+                  description: Alto de la estampa en puntos (mínimo 45).
+                reason:
+                  type: string
+                  maxLength: 190
+                location:
+                  type: string
+                  maxLength: 190
+                signer_name:
+                  type: string
+                  maxLength: 190
+                  description: Si se omite se usa el CN del certificado.
+            encoding:
+              pdf:
+                contentType: application/pdf
+              certificate:
+                contentType: application/x-pkcs12
+              image:
+                contentType: image/png, image/jpeg
+      responses:
+        '200':
+          description: PDF firmado (application/pdf).
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: Nombre sugerido del archivo.
+            X-Signature-Sha256:
+              schema: { type: string }
+              description: SHA-256 del PDF firmado.
+            X-Certificate-Cn:
+              schema: { type: string }
+            X-Certificate-Serial:
+              schema: { type: string }
+            X-Signed-At:
+              schema: { type: string, format: date-time }
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /certificates/inspect:
+    post:
+      tags: [Firma anónima]
+      summary: Validar un certificado .p12 y ver sus datos
+      description: |
+        Permite comprobar la contraseña antes de firmar y mostrar el titular del
+        certificado. El archivo no se almacena.
+      security: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [certificate, password]
+              properties:
+                certificate:
+                  type: string
+                  format: binary
+                password:
+                  type: string
+                  format: password
+      responses:
+        '200':
+          description: Certificado válido.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      type: { type: string, enum: [certificates] }
+                      id: { type: string, description: Huella SHA-256 }
+                      attributes: { $ref: '#/components/schemas/CertificateData' }
+                  meta:
+                    type: object
+                    properties:
+                      usable_for_signing: { type: boolean }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/register:
+    post:
+      tags: [Autenticación]
+      summary: Crear una cuenta
+      description: |
+        Crea el usuario y devuelve un token Bearer. Las invitaciones pendientes
+        dirigidas a ese correo quedan vinculadas a la nueva cuenta.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, password_confirmation]
+              properties:
+                name: { type: string, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 190 }
+                password: { type: string, minLength: 8, format: password }
+                password_confirmation: { type: string, format: password }
+                device_name: { type: string, maxLength: 80, default: web }
+      responses:
+        '201':
+          description: Cuenta creada.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/UserResource' }
+                  meta:
+                    type: object
+                    properties:
+                      token: { type: string }
+                      token_type: { type: string, example: Bearer }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/login:
+    post:
+      tags: [Autenticación]
+      summary: Iniciar sesión
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+                device_name: { type: string, maxLength: 80, default: web }
+      responses:
+        '200':
+          description: Sesión iniciada.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/UserResource' }
+                  meta:
+                    type: object
+                    properties:
+                      token: { type: string }
+                      token_type: { type: string, example: Bearer }
+        '401':
+          description: Credenciales incorrectas.
+          content:
+            application/vnd.api+json:
+              schema: { $ref: '#/components/schemas/ErrorDocument' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /auth/logout:
+    post:
+      tags: [Autenticación]
+      summary: Cerrar sesión (revoca el token actual)
+      responses:
+        '204': { description: Token revocado. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+  /auth/me:
+    get:
+      tags: [Autenticación]
+      summary: Perfil del usuario autenticado
+      responses:
+        '200':
+          description: Usuario actual.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/UserResource' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+  /documents:
+    get:
+      tags: [Documentos]
+      summary: Listar documentos visibles
+      description: Documentos que el usuario creó o en los que fue invitado a firmar.
+      parameters:
+        - $ref: '#/components/parameters/PageNumber'
+        - $ref: '#/components/parameters/PageSize'
+        - name: filter[role]
+          in: query
+          schema: { type: string, enum: [all, owner, signer], default: all }
+        - name: filter[status]
+          in: query
+          schema: { type: string, enum: [open, sealed] }
+        - name: filter[search]
+          in: query
+          schema: { type: string }
+          description: Búsqueda parcial por título (ILIKE).
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [created_at, -created_at, updated_at, -updated_at, title, -title, status, -status, sealed_at, -sealed_at]
+            default: -created_at
+        - name: include
+          in: query
+          schema:
+            type: string
+            example: signers,signatures
+          description: "Relaciones a incluir: owner, signers, signatures, deletion_requests."
+      responses:
+        '200':
+          description: Colección paginada de documentos.
+          content:
+            application/vnd.api+json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/CollectionDocument'
+                  - type: object
+                    properties:
+                      links: { $ref: '#/components/schemas/PaginationLinks' }
+                      meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [Documentos]
+      summary: Crear un documento y compartirlo con los firmantes
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, title, signers_required, signers]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PDF sin cifrar (máx. 20 MB).
+                title: { type: string, maxLength: 180 }
+                signers_required:
+                  type: integer
+                  minimum: 1
+                  maximum: 20
+                signers:
+                  type: array
+                  description: |
+                    Correos de los firmantes. La cantidad debe coincidir con
+                    `signers_required`. El creador puede incluir su propio correo
+                    para firmar también.
+                  items: { type: string, format: email }
+                reason: { type: string, maxLength: 190 }
+            encoding:
+              file:
+                contentType: application/pdf
+              signers:
+                style: form
+                explode: true
+      responses:
+        '201':
+          description: Documento creado.
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/DocumentResource' }
+                  included:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnyResource' }
+                  meta:
+                    type: object
+                    properties:
+                      original_sha256: { type: string }
+                      page_count: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /documents/{document}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Documentos]
+      summary: Ver un documento
+      parameters:
+        - name: include
+          in: query
+          schema: { type: string, default: owner,signers,signatures,deletion_requests }
+      responses:
+        '200':
+          description: Documento con relaciones e incluidas.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/DocumentResource' }
+                  included:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnyResource' }
+                  meta:
+                    type: object
+                    properties:
+                      current_sha256: { type: string }
+                      pending_deletion_request_id: { type: integer, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Documentos]
+      summary: Eliminar un documento sin firmas
+      description: |
+        Solo el creador puede eliminar. Si el documento ya tiene firmas responde
+        `409 document_has_signatures` y debe usarse el flujo de consentimiento.
+      responses:
+        '204': { description: Documento eliminado. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /documents/{document}/file:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Documentos]
+      summary: Descargar o visualizar el PDF actual
+      description: |
+        `disposition=inline` (por defecto) permite previsualizar e imprimir desde el
+        navegador; `disposition=attachment` fuerza la descarga. Accesible al creador
+        y a los firmantes invitados.
+      parameters:
+        - name: disposition
+          in: query
+          schema: { type: string, enum: [inline, attachment], default: inline }
+      responses:
+        '200':
+          description: PDF actual.
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+            X-Document-Sha256:
+              schema: { type: string }
+            X-Document-Pages:
+              schema: { type: string }
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /documents/{document}/signatures:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Firmas]
+      summary: Listar firmas del documento
+      parameters:
+        - $ref: '#/components/parameters/PageNumber'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Firmas registradas.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SignatureResource' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Firmas]
+      summary: Firmar el documento (firmante invitado)
+      description: |
+        Aplica una firma incremental con el certificado del usuario autenticado. Al
+        firmar la última persona, el documento se cierra (`sealed`) y responde con
+        `meta.sealed = true`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [certificate, password, image, page, x, y, width, height]
+              properties:
+                certificate: { type: string, format: binary }
+                password: { type: string, format: password }
+                image: { type: string, format: binary }
+                page: { type: integer, minimum: 1 }
+                x: { type: number }
+                y: { type: number }
+                width: { type: number }
+                height: { type: number }
+                reason: { type: string, maxLength: 190 }
+                location: { type: string, maxLength: 190 }
+                signer_name: { type: string, maxLength: 190 }
+      responses:
+        '201':
+          description: Firma registrada.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/SignatureResource' }
+                  included:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnyResource' }
+                  meta:
+                    type: object
+                    properties:
+                      document_status: { type: string, enum: [open, sealed] }
+                      sealed: { type: boolean }
+                      signatures_required: { type: integer }
+                      signature_count: { type: integer }
+                      remaining_signatures: { type: integer }
+                      current_sha256: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /documents/{document}/events:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Documentos]
+      summary: Historial de actividad del documento
+      parameters:
+        - $ref: '#/components/parameters/PageNumber'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Eventos del documento.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocumentEventResource' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /documents/{document}/verification:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Verificación]
+      summary: Verificar las firmas del documento
+      description: |
+        Comprueba la integridad de los bytes firmados y la validez criptográfica de
+        cada firma. `trusted` solo es verdadero si el servidor tiene configurado un
+        almacén de confianza (`FIRMA_TRUST_STORE_PATH`).
+      responses:
+        '200':
+          description: Informe de verificación.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      type: { type: string, enum: [document-verifications] }
+                      id: { type: string }
+                      attributes:
+                        type: object
+                        properties:
+                          document_status: { type: string }
+                          sha256: { type: string }
+                          trust_store_configured: { type: boolean }
+                          all_valid:
+                            type: boolean
+                            description: Todas las firmas son íntegras y su firma CMS es criptográficamente válida (independiente de la confianza en el certificado).
+                          all_trusted:
+                            type: boolean
+                            description: Todas las firmas encadenan a una raíz del almacén de confianza configurado.
+                          integrity_ok:
+                            type: boolean
+                            description: Ningún byte firmado fue alterado desde la firma.
+                          signatures:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                field_name: { type: string }
+                                intact: { type: boolean }
+                                cryptographically_valid: { type: boolean }
+                                trusted: { type: boolean }
+                                covers_whole_file: { type: boolean }
+                                signer: { type: string, nullable: true }
+                                claimed_signing_time: { type: string, format: date-time, nullable: true }
+                                timestamp_time: { type: string, format: date-time, nullable: true }
+                                errors: { type: array, items: { type: string } }
+                                warnings: { type: array, items: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /documents/{document}/deletion-requests:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    post:
+      tags: [Eliminación con consentimiento]
+      summary: Solicitar la eliminación de un documento firmado
+      description: |
+        Crea la solicitud. Todos los usuarios que hayan firmado deben aprobarla; el
+        rechazo de uno solo la cancela. Si el solicitante ya firmó, su aprobación se
+        registra automáticamente. Un documento sin firmas se elimina con
+        `DELETE /documents/{document}`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '201':
+          description: Solicitud creada.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/DeletionRequestResource' }
+                  included:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnyResource' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /documents/{document}/deletion-requests/{deletionRequest}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+      - $ref: '#/components/parameters/DeletionRequestId'
+    get:
+      tags: [Eliminación con consentimiento]
+      summary: Consultar una solicitud de eliminación
+      parameters:
+        - name: include
+          in: query
+          schema: { type: string, enum: [consents, requested_by] }
+      responses:
+        '200':
+          description: Solicitud con sus consentimientos.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/DeletionRequestResource' }
+                  included:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnyResource' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /documents/{document}/deletion-requests/{deletionRequest}/consents:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+      - $ref: '#/components/parameters/DeletionRequestId'
+    post:
+      tags: [Eliminación con consentimiento]
+      summary: Aprobar o rechazar la eliminación
+      description: |
+        Solo pueden responder quienes hayan firmado. Cuando todos aprueban, el
+        documento se elimina y la respuesta trae `meta.document_deleted = true`.
+        Un rechazo cancela la solicitud y conserva el documento.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approved, rejected]
+                comment: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Decisión registrada.
+          content:
+            application/vnd.api+json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/DeletionRequestResource' }
+                  included:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnyResource' }
+                  meta:
+                    type: object
+                    properties:
+                      document_status: { type: string, enum: [open, sealed, deleted] }
+                      document_deleted: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /openapi.yaml:
+    get:
+      tags: [Descripción de la API]
+      summary: Especificación OpenAPI
+      security: []
+      responses:
+        '200':
+          description: Documento OpenAPI 3.0 en YAML.
+          content:
+            application/yaml:
+              schema: { type: string }
+  /docs:
+    get:
+      tags: [Descripción de la API]
+      summary: Visor de documentación (Swagger UI)
+      security: []
+      responses:
+        '200':
+          description: Página HTML con el visor.
+          content:
+            text/html:
+              schema: { type: string }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Sanctum
+  parameters:
+    DocumentId:
+      name: document
+      in: path
+      required: true
+      description: UUID público del documento.
+      schema: { type: string, format: uuid }
+    DeletionRequestId:
+      name: deletionRequest
+      in: path
+      required: true
+      schema: { type: integer }
+    PageNumber:
+      name: page[number]
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page[size]
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 15 }
+  responses:
+    BadRequest:
+      description: Parámetro no soportado (include, sort o filtro).
+      content:
+        application/vnd.api+json:
+          schema: { $ref: '#/components/schemas/ErrorDocument' }
+    Unauthenticated:
+      description: Token ausente o inválido.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, example: Bearer }
+      content:
+        application/vnd.api+json:
+          schema: { $ref: '#/components/schemas/ErrorDocument' }
+    Forbidden:
+      description: El usuario no tiene permiso sobre el recurso.
+      content:
+        application/vnd.api+json:
+          schema: { $ref: '#/components/schemas/ErrorDocument' }
+    NotFound:
+      description: El recurso no existe.
+      content:
+        application/vnd.api+json:
+          schema: { $ref: '#/components/schemas/ErrorDocument' }
+    Conflict:
+      description: La regla de negocio impide la operación (documento cerrado, ya firmado, etc.).
+      content:
+        application/vnd.api+json:
+          schema: { $ref: '#/components/schemas/ErrorDocument' }
+    ValidationError:
+      description: Datos no válidos.
+      content:
+        application/vnd.api+json:
+          schema: { $ref: '#/components/schemas/ErrorDocument' }
+    TooManyRequests:
+      description: Límite de solicitudes excedido.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/vnd.api+json:
+          schema: { $ref: '#/components/schemas/ErrorDocument' }
+  schemas:
+    AnyResource:
+      type: object
+      properties:
+        type: { type: string }
+        id: { type: string }
+        attributes: { type: object, additionalProperties: true }
+        relationships: { type: object, additionalProperties: true }
+        links: { type: object, additionalProperties: { type: string } }
+    ErrorObject:
+      type: object
+      required: [status, code, title, detail]
+      properties:
+        status: { type: string, example: '422' }
+        code: { type: string, example: invalid_certificate }
+        title: { type: string, example: No se pudo abrir el certificado }
+        detail: { type: string }
+        source:
+          type: object
+          properties:
+            pointer: { type: string, example: /data/attributes/password }
+        meta: { type: object, additionalProperties: true }
+    ErrorDocument:
+      type: object
+      required: [errors]
+      properties:
+        errors:
+          type: array
+          items: { $ref: '#/components/schemas/ErrorObject' }
+    PaginationLinks:
+      type: object
+      properties:
+        self: { type: string }
+        first: { type: string }
+        last: { type: string }
+        prev: { type: string }
+        next: { type: string }
+    PaginationMeta:
+      type: object
+      properties:
+        pagination:
+          type: object
+          properties:
+            page: { type: integer }
+            per_page: { type: integer }
+            total: { type: integer }
+            last_page: { type: integer }
+    UserAttributes:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        created_at: { type: string, format: date-time, nullable: true }
+    UserResource:
+      type: object
+      properties:
+        type: { type: string, enum: [users] }
+        id: { type: string }
+        attributes: { $ref: '#/components/schemas/UserAttributes' }
+    DocumentPermissions:
+      type: object
+      properties:
+        can_sign: { type: boolean }
+        can_download: { type: boolean }
+        can_delete: { type: boolean }
+        can_request_deletion: { type: boolean }
+        can_consent_deletion: { type: boolean }
+    DocumentAttributes:
+      type: object
+      properties:
+        title: { type: string }
+        status: { type: string, enum: [open, sealed] }
+        sealed: { type: boolean }
+        signers_required: { type: integer }
+        signature_count: { type: integer }
+        remaining_signatures: { type: integer }
+        page_count: { type: integer }
+        original_sha256: { type: string }
+        current_sha256: { type: string }
+        sealed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        my_role: { type: string, enum: [owner, owner_and_signer, signer, observer] }
+        my_signature_status: { type: string, enum: [pending, signed], nullable: true }
+        permissions: { $ref: '#/components/schemas/DocumentPermissions' }
+    DocumentResource:
+      type: object
+      properties:
+        type: { type: string, enum: [documents] }
+        id: { type: string, format: uuid }
+        attributes: { $ref: '#/components/schemas/DocumentAttributes' }
+        relationships:
+          type: object
+          properties:
+            owner:
+              type: object
+              properties:
+                data:
+                  type: object
+                  nullable: true
+                  properties:
+                    type: { type: string, enum: [users] }
+                    id: { type: string }
+            signers:
+              type: object
+              properties:
+                data:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string, enum: [document-signers] }
+                      id: { type: string }
+            signatures:
+              type: object
+              properties:
+                data:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string, enum: [signatures] }
+                      id: { type: string }
+        links:
+          type: object
+          properties:
+            self: { type: string }
+            file: { type: string }
+            verification: { type: string }
+    CollectionDocument:
+      type: object
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/DocumentResource' }
+    DocumentSignerAttributes:
+      type: object
+      properties:
+        email: { type: string, format: email }
+        position: { type: integer }
+        status: { type: string, enum: [pending, signed] }
+        claimed: { type: boolean, description: Si el invitado ya tiene cuenta }
+        invited_at: { type: string, format: date-time, nullable: true }
+        signed_at: { type: string, format: date-time, nullable: true }
+        user_name: { type: string, nullable: true }
+    DocumentSignerResource:
+      type: object
+      properties:
+        type: { type: string, enum: [document-signers] }
+        id: { type: string }
+        attributes: { $ref: '#/components/schemas/DocumentSignerAttributes' }
+    CertificateData:
+      type: object
+      properties:
+        subject: { type: string }
+        common_name: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        serial: { type: string }
+        issuer: { type: string }
+        fingerprint_sha256: { type: string }
+        valid_from: { type: string, format: date-time, nullable: true }
+        valid_to: { type: string, format: date-time, nullable: true }
+        expired: { type: boolean }
+    SignaturePlacement:
+      type: object
+      properties:
+        page: { type: integer }
+        x: { type: number }
+        y: { type: number }
+        width: { type: number }
+        height: { type: number }
+        coordinate_system:
+          type: string
+          example: points from the top-left corner of the displayed page
+    SignatureAttributes:
+      type: object
+      properties:
+        field_name: { type: string, example: FirmaDigital1 }
+        sequence: { type: integer }
+        signer_name: { type: string }
+        signer_email: { type: string, nullable: true }
+        certificate: { $ref: '#/components/schemas/CertificateData' }
+        signed_at: { type: string, format: date-time }
+        placement: { $ref: '#/components/schemas/SignaturePlacement' }
+        previous_sha256: { type: string, nullable: true }
+        signed_sha256: { type: string }
+        reason: { type: string, nullable: true }
+        location: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+    SignatureResource:
+      type: object
+      properties:
+        type: { type: string, enum: [signatures] }
+        id: { type: string }
+        attributes: { $ref: '#/components/schemas/SignatureAttributes' }
+    DeletionRequestAttributes:
+      type: object
+      properties:
+        status: { type: string, enum: [pending, approved, rejected, cancelled] }
+        reason: { type: string, nullable: true }
+        required_consents: { type: integer }
+        approved_consents: { type: integer }
+        rejected_consents: { type: integer }
+        pending_consents:
+          type: array
+          items: { type: integer }
+          description: IDs de usuario que aún no respondieron.
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time, nullable: true }
+    DeletionRequestResource:
+      type: object
+      properties:
+        type: { type: string, enum: [deletion-requests] }
+        id: { type: string }
+        attributes: { $ref: '#/components/schemas/DeletionRequestAttributes' }
+    ConsentAttributes:
+      type: object
+      properties:
+        decision: { type: string, enum: [approved, rejected] }
+        comment: { type: string, nullable: true }
+        decided_at: { type: string, format: date-time }
+        user_name: { type: string, nullable: true }
+        user_email: { type: string, nullable: true }
+    ConsentResource:
+      type: object
+      properties:
+        type: { type: string, enum: [deletion-consents] }
+        id: { type: string }
+        attributes: { $ref: '#/components/schemas/ConsentAttributes' }
+    DocumentEventAttributes:
+      type: object
+      properties:
+        type:
+          type: string
+          example: signature_added
+          enum:
+            - document_created
+            - signature_added
+            - document_sealed
+            - deletion_requested
+            - deletion_consent_recorded
+            - deletion_rejected
+            - document_deleted
+        description: { type: string }
+        meta: { type: object, additionalProperties: true }
+        actor_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+    DocumentEventResource:
+      type: object
+      properties:
+        type: { type: string, enum: [document-events] }
+        id: { type: string }
+        attributes: { $ref: '#/components/schemas/DocumentEventAttributes' }

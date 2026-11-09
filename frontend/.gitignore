@@ -8,8 +8,9 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
-dist-ssr
+# dist and dist-ssr committed intentionally: prebuilt static files for Apache (no build required)
+# dist
+# dist-ssr
 *.local
 
 # Editor directories and files

@@ -1,0 +1,20 @@
+# SPA fallback for React Router (BrowserRouter)
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+  # Do not rewrite existing files/directories
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+  # Proxy /api to the Laravel backend (adjust target to your backend URL)
+  # Requires: a2enmod proxy proxy_http rewrite
+  # RewriteRule ^api/(.*)$ http://127.0.0.1:8000/api/$1 [P,L]
+  RewriteRule ^ index.html [L]
+</IfModule>
+
+# Sensible defaults for static assets
+<IfModule mod_headers.c>
+  <FilesMatch "\.(html)$">
+    Header set Cache-Control "no-cache"
+  </FilesMatch>
+</IfModule>

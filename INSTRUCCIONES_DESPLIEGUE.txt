@@ -1,0 +1,280 @@
+INSTRUCCIONES DE DESPLIEGUE - Firma Digital (PDF con certificado .p12)
+=======================================================================
+
+Este documento explica cómo montar el sistema en un servidor con Apache,
+sin conexión a internet para instalar dependencias. El proyecto tiene dos
+partes:
+
+  - backend/  -> API REST en Laravel 12 (PHP 8.2 + PostgreSQL 14)
+  - frontend/ -> SPA en React, ya COMPILADA (archivos estáticos, sin npm)
+
+Archivos de distribución:
+  - firma-digital-backend.zip   (incluye backend/vendor, no requiere Composer)
+  - firma-digital-frontend.zip  (incluye frontend/dist, no requiere build)
+
+IMPORTANTE: ninguno de los .zip incluye backend/.env. Debes crearlo en el
+servidor (ver paso B.3). Nunca subas .env con credenciales al repositorio.
+
+
+A. REQUISITOS DEL SERVIDOR
+--------------------------
+
+Backend (PHP):
+  - PHP 8.2.x (probado con 8.2.35)
+  - Extensiones: openssl, mbstring, pdo_pgsql, pgsql, fileinfo, gd (o imagick),
+    xml, dom, curl, zip, tokenizer, ctype, json, bcmath
+  - Ajustes recomendados en php.ini (la firma sube PDF + .p12 + imagen):
+      upload_max_filesize = 25M
+      post_max_size       = 30M
+      memory_limit        = 512M
+      max_execution_time  = 120
+
+Base de datos:
+  - PostgreSQL 14 (o compatible)
+  - Una base de datos y un usuario con permisos sobre ella
+
+Frontend / Apache:
+  - Apache 2.4
+  - Módulos: mod_rewrite, mod_headers
+  - Si el frontend y el backend se sirven en el mismo dominio/puerto (recomendado),
+    también: mod_proxy y mod_proxy_http, para reenviar /api al backend.
+  - AllowOverride All habilitado en el directorio del frontend (para el .htaccess)
+
+Sin internet:
+  - backend/vendor ya va incluido en el zip y en el repositorio: NO es necesario
+    ejecutar "composer install".
+  - frontend/dist ya va compilado: NO es necesario ejecutar "npm install" ni
+    "npm run build".
+
+
+B. DESPLIEGUE DEL BACKEND (Laravel)
+-----------------------------------
+
+B.1. Descomprimir
+  Descomprime firma-digital-backend.zip en la ruta que prefieras, por ejemplo:
+      /var/www/firma-digital/backend
+  La carpeta debe contener artisan, composer.json, app/, config/, vendor/, etc.
+
+B.2. Permisos de escritura
+  El usuario de Apache/PHP (p. ej. www-data) debe poder escribir en:
+      backend/storage
+      backend/bootstrap/cache
+  Ejemplo:
+      chown -R www-data:www-data storage bootstrap/cache
+      chmod -R ug+rwx storage bootstrap/cache
+
+B.3. Archivo de entorno (.env)
+  Crea el archivo de entorno a partir del ejemplo:
+      cd /var/www/firma-digital/backend
+      cp .env.example .env
+
+  Edita .env y ajusta como mínimo:
+
+      APP_NAME="Firma Digital"
+      APP_ENV=production
+      APP_DEBUG=false
+      APP_URL=https://tu-dominio-o-ip   (URL pública del backend)
+
+      DB_CONNECTION=pgsql
+      DB_HOST=127.0.0.1                 (o el host de tu PostgreSQL)
+      DB_PORT=5432
+      DB_DATABASE=firma_digital
+      DB_USERNAME=tu_usuario
+      DB_PASSWORD=tu_contraseña
+
+      # Disco donde se guardan los PDF (local por defecto)
+      FIRMA_DISK=local
+
+      # Opcional: almacén de confianza para marcar firmas como "trusted"
+      # (ruta a un .pem con CAs de confianza). Si se omite, las firmas válidas
+      # se reportan con all_trusted=false en certificados autofirmados.
+      # FIRMA_TRUST_STORE_PATH=/ruta/ca-bundle.pem
+
+  Genera la clave de aplicación (usa el PHP y el vendor incluidos):
+      php artisan key:generate
+  Si "php artisan" no funciona en tu entorno, genera una clave y ponla en .env:
+      APP_KEY=base64:...   (32 bytes aleatorios codificados en base64)
+
+  Limpia y cachea configuración (recomendado en producción):
+      php artisan config:cache
+      php artisan route:cache
+
+B.4. Migraciones de base de datos
+  Con la base de datos creada y accesible:
+      php artisan migrate --force
+  Esto crea las tablas (users, documents, document_signers, document_signatures,
+  tokens, solicitudes de borrado, eventos, etc.).
+
+B.5. Publicar el backend con Apache (recomendado)
+  Configura un VirtualHost cuyo DocumentRoot apunte a la carpeta public:
+      DocumentRoot /var/www/firma-digital/backend/public
+
+  Ejemplo de VirtualHost:
+      <VirtualHost *:8000>
+          ServerName tu-servidor
+          DocumentRoot /var/www/firma-digital/backend/public
+
+          <Directory /var/www/firma-digital/backend/public>
+              AllowOverride All
+              Require all granted
+          </Directory>
+
+          ErrorLog ${APACHE_LOG_DIR}/firma-backend-error.log
+          CustomLog ${APACHE_LOG_DIR}/firma-backend-access.log combined
+      </VirtualHost>
+
+  Notas:
+  - backend/public/.htaccess ya viene incluido (reglas de Laravel).
+  - Activa mod_rewrite si no está activo:  a2enmod rewrite && systemctl reload apache2
+  - Si sirves el backend en otro puerto, recuerda abrirlo en el firewall y
+    añadirlo en Listen (p. ej. "Listen 8000").
+
+  Alternativa rápida (no recomendada para producción): servidor embebido de PHP
+      php -d upload_max_filesize=25M -d post_max_size=30M -d memory_limit=512M \
+          artisan serve --host=0.0.0.0 --port=8000
+
+B.6. Verificar el backend
+  - Documentación Swagger UI:  http://<host-backend>/api/v1/docs
+  - Especificación OpenAPI:    http://<host-backend>/api/v1/openapi.yaml
+  - Una petición básica:       GET http://<host-backend>/api/v1/documents
+    (responderá 401 sin token, lo cual confirma que la API responde).
+
+  Nota sobre vendor/offline: las dependencias incluidas se instalaron con PHP 8.2
+  y las extensiones indicadas. Si tu PHP o extensiones difieren, algún paquete
+  puede fallar al cargar; en ese caso regenera vendor/ en un entorno compatible
+  (con internet) y cópialo al servidor.
+
+
+C. DESPLIEGUE DEL FRONTEND (archivos estáticos en Apache)
+---------------------------------------------------------
+
+El frontend es una SPA (React Router con BrowserRouter) ya compilada. Basta con
+servir el contenido de frontend/dist como archivos estáticos.
+
+C.1. Descomprimir y copiar
+  Descomprime firma-digital-frontend.zip. Copia el CONTENIDO de la carpeta
+  frontend/dist/ al DocumentRoot del sitio web que servirá la interfaz, por
+  ejemplo:
+      /var/www/firma-digital/html
+
+  Dentro de ese directorio deben quedar (al menos):
+      index.html
+      .htaccess
+      assets/
+      favicon.svg
+      icons.svg
+
+  (Copia el contenido de dist/, no la carpeta dist en sí, salvo que quieras
+  servirla como subdirectorio; ver nota de subcarpeta en C.5).
+
+C.2. Habilitar rewrite y .htaccess (obligatorio para la SPA)
+  Al usar BrowserRouter, recargar una ruta como /login o /documents/123 debe
+  devolver index.html. El .htaccess incluido ya tiene la regla de fallback.
+
+  1) Habilita módulos:
+       a2enmod rewrite headers
+       systemctl reload apache2
+
+  2) Permite que el directorio use .htaccess:
+       <Directory /var/www/firma-digital/html>
+           AllowOverride All
+           Require all granted
+       </Directory>
+
+C.3. Conectar el frontend con el backend (/api)
+  El frontend realiza las peticiones a rutas relativas "/api/v1/...". Por eso,
+  lo más sencillo es servir frontend y backend bajo el MISMO origen (mismo
+  esquema, dominio y puerto) y reenviar /api al backend con un proxy inverso.
+
+  Opción recomendada (mismo VirtualHost, proxy a Laravel):
+    - Habilita proxy:
+        a2enmod proxy proxy_http
+        systemctl reload apache2
+    - En el VirtualHost del frontend (o en el .htaccess de dist/, que ya trae la
+      regla comentada), añade ANTES del "RewriteRule ^ index.html [L]":
+        RewriteRule ^api/(.*)$ http://127.0.0.1:8000/api/$1 [P,L]
+      (ajusta 127.0.0.1:8000 a la URL/puerto real donde corre el backend).
+
+  Ejemplo de VirtualHost combinado (frontend estático + proxy al backend):
+      <VirtualHost *:80>
+          ServerName tu-dominio
+          DocumentRoot /var/www/firma-digital/html
+
+          <Directory /var/www/firma-digital/html>
+              AllowOverride All
+              Require all granted
+          </Directory>
+
+          # Si no usas la regla del .htaccess, puedes proxyear aquí:
+          # ProxyPass        /api  http://127.0.0.1:8000/api
+          # ProxyPassReverse /api  http://127.0.0.1:8000/api
+      </VirtualHost>
+
+  Otras opciones:
+    - Backend en otro host: el navegador bloqueará las peticiones si el backend
+      no envía CORS adecuado. El backend incluye config/cors.php; ajusta los
+      orígenes permitidos y APP_URL según tu despliegue.
+    - Subdominios distintos: configura CORS y cookies/tokens en consecuencia.
+
+C.4. Caché de archivos estáticos (opcional)
+  El .htaccess ya evita cachear index.html. Los archivos en /assets llevan hash
+  en el nombre, por lo que es seguro cachearlos largo tiempo si lo deseas:
+      <FilesMatch "\.(js|css|mjs|svg|png|jpg|ico)$">
+          Header set Cache-Control "public, max-age=31536000, immutable"
+      </FilesMatch>
+
+C.5. Nota sobre subcarpeta
+  La compilación actual asume que la app se sirve desde la raíz ("/"). Si vas a
+  publicarla en una subcarpeta (p. ej. https://dominio/firma/), será necesario
+  recompilar el frontend ajustando "base" en vite.config.ts y volver a generar
+  frontend/dist (esto requiere Node/npm en un entorno con herramientas de build).
+
+
+D. VERIFICACIÓN FINAL
+---------------------
+
+1. Abre la URL del frontend en el navegador. Debe cargar la pantalla de inicio.
+2. Navega a una ruta interna (p. ej. /login) y recarga la página (F5): debe
+   seguir funcionando (confirma que el fallback del .htaccess está activo).
+3. Prueba la firma anónima: sube un PDF, un certificado .p12, la contraseña y
+   una imagen, coloca la firma y descarga el PDF firmado.
+4. Regístrate/inicia sesión y crea un documento con firmantes para probar el
+   flujo multiformante (el documento se cierra al firmar el último).
+5. Revisa la documentación de la API en /api/v1/docs (accesible vía el proxy).
+6. Revisa los logs si algo falla:
+     - Apache:  error.log / access.log del VirtualHost
+     - Laravel: backend/storage/logs/laravel.log
+
+
+E. LIMITACIONES Y NOTAS
+-----------------------
+
+- Sin envío de correos: las invitaciones a firmantes se registran en el sistema
+  y se vinculan automáticamente cuando la persona se registra o inicia sesión con
+  ese correo; no se envía email de notificación.
+- Sin sellado de tiempo (TSA).
+- Los PDF cifrados/protegidos con contraseña se rechazan (error "encrypted_pdf").
+- Certificados autofirmados: la firma puede ser íntegra y criptográficamente
+  válida (all_valid=true) pero no confiable (all_trusted=false) si no se configura
+  FIRMA_TRUST_STORE_PATH con un almacén de CAs de confianza.
+- Los archivos .p12 y sus contraseñas NO se almacenan; solo se guardan datos
+  públicos del certificado y hashes.
+- Seguridad: sirve el sitio por HTTPS en producción, restringe el acceso a
+  backend/.env y no expongas la carpeta backend/ completa, solo backend/public.
+
+
+F. RESUMEN RÁPIDO
+-----------------
+
+Backend:
+  1) Descomprimir firma-digital-backend.zip
+  2) cp .env.example .env  -> configurar DB_*, APP_URL, APP_KEY
+  3) Permisos de escritura en storage/ y bootstrap/cache
+  4) php artisan migrate --force
+  5) Apache DocumentRoot -> backend/public (mod_rewrite activo)
+
+Frontend:
+  1) Copiar contenido de frontend/dist/ al DocumentRoot del sitio
+  2) AllowOverride All + mod_rewrite/mod_headers
+  3) Proxy /api -> backend (mod_proxy, mod_proxy_http) para mismo origen
+  4) Abrir el sitio en el navegador
